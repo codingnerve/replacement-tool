@@ -98,7 +98,11 @@ export function replacePhoneNumbers(
   const { normalizedText, mapNormToRawIndex } = buildNormalizedTextWithMap(inputText);
 
   // 2. Scan candidate phone spans on normalizedText
-  const phonePattern = /(?:[\(\{\[]\s*)?(?:\+\s*)?\d(?:[\s\-\.\/()\[\]{},;:~_*#\u00A0\u2000-\u200B\u3000]*\d)+/gu;
+  // Between digits we accept: the usual separators, invisible/combining marks, and any
+  // punctuation or symbol (arrows, dots, bars, emoji, ...) of up to 3 characters as long as it
+  // is attached to what precedes it, so "5155 | 8426" (two numbers) is not merged but
+  // "+1\u2192888\u2192889~5155" is.
+  const phonePattern = /(?:[\(\{\[]\s*)?(?:\+\s*)?\d(?:(?:[\s\-\.\/()\[\]{},;:~_*#\u00A0\u2000-\u200B\u3000\p{M}\p{Cf}]|(?<!\s)[\p{P}\p{S}]{1,3})*\d)+/gu;
 
   const phoneMatches: { start: number; end: number; raw: string; norm: string }[] = [];
   let match: RegExpExecArray | null;
