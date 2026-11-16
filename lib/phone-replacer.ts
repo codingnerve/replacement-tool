@@ -39,8 +39,11 @@ export interface ReplaceResult {
   textReplacementsCount: number;
   ruleStats: Record<string, number>;
   spans: SpanMatch[];
-  segments: { text: string; match?: SpanMatch }[];
+  /** The full output split into pieces; `changed` pieces are replacements. */
+  segments: { text: string; changed: boolean }[];
 }
+
+type Range = [number, number];
 
 /**
  * Checks if a phone number span matches a specific prefix rule.
@@ -87,7 +90,7 @@ export function replacePhoneNumbers(
       textReplacementsCount: 0,
       ruleStats: {},
       spans: [],
-      segments: [{ text: '' }],
+      segments: [],
     };
   }
 
@@ -95,16 +98,27 @@ export function replacePhoneNumbers(
   const { normalizedText, mapNormToRawIndex } = buildNormalizedTextWithMap(inputText);
 
   // 2. Scan candidate phone spans on normalizedText
-  const phonePattern = /(?:[\(\{\[]?\s*\+?\s*)?\d(?:[\s\-\.\/()\[\]{},;:~_*#\u00A0\u2000-\u200B\u3000]*\d)+/gu;
+  const phonePattern = /(?:[\(\{\[]\s*)?(?:\+\s*)?\d(?:[\s\-\.\/()\[\]{},;:~_*#\u00A0\u2000-\u200B\u3000]*\d)+/gu;
 
   const phoneMatches: { start: number; end: number; raw: string; norm: string }[] = [];
   let match: RegExpExecArray | null;
 
   phonePattern.lastIndex = 0;
   while ((match = phonePattern.exec(normalizedText)) !== null) {
-    const normMatchStr = match[0];
+    let normMatchStr = match[0];
     const normStart = match.index;
-    const normEnd = normStart + normMatchStr.length;
+    let normEnd = normStart + normMatchStr.length;
+
+    // A number like "+52-800-461-0(242)" ends with its closing bracket; keep it with the number.
+    for (const [open, close] of [['(', ')'], ['[', ']'], ['{', '}']]) {
+      const opens = normMatchStr.split(open).length - 1;
+      const closes = normMatchStr.split(close).length - 1;
+      if (opens > closes && normalizedText[normEnd] === close) {
+        normEnd += 1;
+        normMatchStr = normalizedText.slice(normStart, normEnd);
+        phonePattern.lastIndex = normEnd;
+      }
+    }
 
     // Map back to original raw input offsets
     const rawStart = mapNormToRawIndex[normStart];
@@ -144,6 +158,8 @@ export function replacePhoneNumbers(
   });
 
   let phoneOutput = '';
+  // Parts of the output that were replaced (kept in step with the output string).
+  let changedRanges: Range[] = [];
   let lastIndex = 0;
   let totalDigitsReplaced = 0;
   const phoneSpans: SpanMatch[] = [];
@@ -184,6 +200,7 @@ export function replacePhoneNumbers(
     };
 
     phoneSpans.push(spanMatch);
+    changedRanges.push([phoneOutput.length, phoneOutput.length + replacementText.length]);
     phoneOutput += replacementText;
     lastIndex = m.end;
   });
@@ -205,11 +222,11 @@ export function replacePhoneNumbers(
     const escapedSearch = tRule.findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const regex = new RegExp(escapedSearch, flags);
 
-    let tMatch: RegExpExecArray | null;
-    let occurrences = 0;
 
+    const matches: { index: number; length: number }[] = [];
+    let tMatch: RegExpExecArray | null;
     while ((tMatch = regex.exec(finalOutput)) !== null) {
-      occurrences++;
+      matches.push({ index: tMatch.index, length: tMatch[0].length });
       textSpans.push({
         id: phoneSpans.length + textSpans.length + 1,
         type: 'TEXT',
@@ -222,17 +239,62 @@ export function replacePhoneNumbers(
       });
     }
 
-    if (occurrences > 0) {
-      textReplacementsCount += occurrences;
-      ruleStats[`Text: "${tRule.findText}"`] = occurrences;
-      finalOutput = finalOutput.replace(regex, tRule.replaceWith);
+    if (matches.length === 0) return;
+
+    textReplacementsCount += matches.length;
+    ruleStats[`Text: "${tRule.findText}"`] = matches.length;
+
+    // Build the new text, remembering where each replacement landed.
+    const edits: { oldStart: number; oldEnd: number; newStart: number; newEnd: number }[] = [];
+    let next = '';
+    let cursor = 0;
+    for (const m of matches) {
+      next += finalOutput.slice(cursor, m.index);
+      const newStart = next.length;
+      next += tRule.replaceWith;
+      edits.push({ oldStart: m.index, oldEnd: m.index + m.length, newStart, newEnd: next.length });
+      cursor = m.index + m.length;
     }
+    next += finalOutput.slice(cursor);
+
+    // Move earlier highlights to where that text now sits.
+    const mapPos = (pos: number, isEnd: boolean): number => {
+      let lo = 0;
+      let hi = edits.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (edits[mid].oldEnd <= pos) lo = mid + 1;
+        else hi = mid;
+      }
+      const inside = edits[lo];
+      if (inside && pos > inside.oldStart) return isEnd ? inside.newEnd : inside.newStart;
+      return lo > 0 ? edits[lo - 1].newEnd + (pos - edits[lo - 1].oldEnd) : pos;
+    };
+    changedRanges = [
+      ...changedRanges.map(([s, e]): Range => [mapPos(s, false), mapPos(e, true)]),
+      ...edits.map((e): Range => [e.newStart, e.newEnd]),
+    ];
+    finalOutput = next;
   });
 
   const allSpans = [...phoneSpans, ...textSpans];
 
-  // Re-segment final output for highlighting
-  const segments: { text: string; match?: SpanMatch }[] = [{ text: finalOutput }];
+  // Split the final output into plain and replaced pieces so the page can highlight them.
+  const sorted = changedRanges.filter(([s, e]) => e > s).sort((a, b) => a[0] - b[0]);
+  const merged: Range[] = [];
+  for (const [s, e] of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && s < last[1]) last[1] = Math.max(last[1], e);
+    else merged.push([s, e]);
+  }
+  const segments: { text: string; changed: boolean }[] = [];
+  let pos = 0;
+  for (const [s, e] of merged) {
+    if (s > pos) segments.push({ text: finalOutput.slice(pos, s), changed: false });
+    segments.push({ text: finalOutput.slice(s, e), changed: true });
+    pos = e;
+  }
+  if (pos < finalOutput.length) segments.push({ text: finalOutput.slice(pos), changed: false });
 
   return {
     output: finalOutput,
